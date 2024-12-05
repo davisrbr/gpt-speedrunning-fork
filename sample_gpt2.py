@@ -59,12 +59,8 @@ def generate_forward(self, idx, v1, attn_blocksize):
     """Generate logits for the next token."""
     B, T = idx.size(0), idx.size(1)
     
-    # Create a simpler mask for generation
-    # We only need causal masking since we're processing one document at a time
-    def causal_mask(b, h, q_idx, kv_idx):
-        return q_idx[:, None] >= kv_idx[None, :]
-    
-    block_mask = create_block_mask(causal_mask, None, None, T, T, device=idx.device, _compile=False)
+    # Manually create the causal mask
+    block_mask = torch.tril(torch.ones((1, 1, T, T), dtype=torch.bool, device=idx.device))
     
     # Forward pass through the model
     x = self.transformer.wte(idx)  # token embeddings
