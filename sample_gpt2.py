@@ -32,10 +32,20 @@ for m in model.modules():
     if isinstance(m, CastedLinear):
         m.float()
 
-# Load the checkpoint
+# Load the checkpoint and fix the state dict keys
 checkpoint = torch.load(checkpoint_path, map_location='cpu')
 state_dict = checkpoint['model']
-model.load_state_dict(state_dict)
+
+# Remove '_orig_mod.' prefix from state dict keys
+fixed_state_dict = {}
+for k, v in state_dict.items():
+    if k.startswith('_orig_mod.'):
+        fixed_state_dict[k[10:]] = v  # Remove '_orig_mod.' (10 characters)
+    else:
+        fixed_state_dict[k] = v
+
+# Load the fixed state dict
+model.load_state_dict(fixed_state_dict)
 
 # Set the model to evaluation mode
 model.eval()
