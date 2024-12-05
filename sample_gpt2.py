@@ -91,13 +91,14 @@ def generate(model, enc, context, max_new_tokens, temperature=1.0, top_k=None):
     # Encode the context using tiktoken
     context_tokens = [eot_token]  # Start with EOT token as in fineweb.py
     context_tokens.extend(enc.encode(context))
-    idx = np.array(context_tokens, dtype=np.uint16)
-    idx = torch.tensor(idx, device=device).unsqueeze(0)
-
+    
+    # Ensure the idx tensor is of type torch.long
+    idx = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(0)
+    
     generated = idx
     v1 = None  # Initialize key/value cache
     attn_blocksize = torch.tensor(1792, device=device)  # Max attention block size
-
+    
     for _ in range(max_new_tokens):
         with torch.no_grad():
             logits, v1 = model.generate_forward(generated, v1, attn_blocksize)
