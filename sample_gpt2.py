@@ -57,30 +57,27 @@ eot_token = enc.eot_token  # End-of-text token ID
 # Modify the GPT class to include a generate_forward method
 def generate_forward(self, idx, v1, attn_blocksize):
     """Generate logits for the next token."""
-    S = idx.size(1)
-    docs = (idx == eot_token).cumsum(1)
+    B, T = idx.size(0), idx.size(1)
     
-    def document_causal_mask(b, h, q_idx, kv_idx):
-        causal_mask = q_idx >= kv_idx
-        document_mask = docs[0, q_idx] == docs[0, kv_idx]
-        window_mask = q_idx - kv_idx < attn_blocksize
-        return causal_mask & document_mask & window_mask
+    # Create a simpler mask for generation
+    # We only need causal masking since we're processing one document at a time
+    def causal_mask(b, h, q_idx, kv_idx):
+        return q_idx[:, None] >= kv_idx[None, :]
     
-    # Create block mask using the same approach as training
-    block_mask = create_block_mask(document_causal_mask, None, None, S, S, device=idx.device, _compile=True)
+    block_mask = create_block_mask(causal_mask, None, None, T, T, device=idx.device, _compile=False)
     
     # Forward pass through the model
-    x = self.transformer.wte(idx) # token embeddings
+    x = self.transformer.wte(idx)  # token embeddings
     x = norm(x)
     x0 = x
     
-    # Store outputs for U-Net skip connections
+    # Process through encoder layers
     skip_connections = []
-    # Encoder pass
     for i in range(self.num_encoder_layers):
         x, v1 = self.transformer.h[i](x, v1, x0, block_mask)
         skip_connections.append(x)
-    # Decoder pass with skip connections
+    
+    # Process through decoder layers with skip connections
     for i in range(self.num_decoder_layers):
         x = x + self.skip_weights[i] * skip_connections.pop()
         x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask)
