@@ -59,36 +59,36 @@ def generate_forward(self, idx, v1, attn_blocksize):
     """Generate logits for the next token."""
     S = idx.size(1)
     docs = (idx == eot_token).cumsum(1)
+    
     def document_causal_mask(b, h, q_idx, kv_idx):
         causal_mask = q_idx >= kv_idx
         document_mask = docs[0, q_idx] == docs[0, kv_idx]
         window_mask = q_idx - kv_idx < attn_blocksize
         return causal_mask & document_mask & window_mask
-    block_mask = create_block_mask(
-        document_causal_mask, None, None, S, S, device=idx.device, _compile=True
-    )
-
-    # Forward pass
-    x = self.transformer.wte(idx)  # Token embeddings
+    
+    # Create block mask using the same approach as training
+    block_mask = create_block_mask(document_causal_mask, None, None, S, S, device=idx.device, _compile=True)
+    
+    # Forward pass through the model
+    x = self.transformer.wte(idx) # token embeddings
     x = norm(x)
     x0 = x
-
+    
     # Store outputs for U-Net skip connections
     skip_connections = []
-
     # Encoder pass
     for i in range(self.num_encoder_layers):
         x, v1 = self.transformer.h[i](x, v1, x0, block_mask)
         skip_connections.append(x)
-
-    # Decoder pass with weighted skip connections
+    # Decoder pass with skip connections
     for i in range(self.num_decoder_layers):
         x = x + self.skip_weights[i] * skip_connections.pop()
         x, v1 = self.transformer.h[self.num_encoder_layers + i](x, v1, x0, block_mask)
-
+    
     x = norm(x)
     logits = self.lm_head(x)
-    logits = 30 * torch.tanh(logits / 30)  # Logit clamping as in training
+    logits = 30 * torch.tanh(logits / 30)  # Same clamping as in training
+    
     return logits, v1
 
 # Monkey-patch the generate_forward method to the GPT class
