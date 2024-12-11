@@ -8,7 +8,6 @@ import uuid
 import time
 import contextlib
 from dataclasses import dataclass
-import click
 from pathlib import Path
 
 import torch
@@ -386,7 +385,10 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-
+    # Wandb hyperparams
+    wandb_project: str = 'gpt-training'
+    # Additional hyperparams
+    pretrained_weights: str = None
 
 @click.command()
 @click.option('--input-bin', default='data/fineweb10B/fineweb_train_*.bin', help='Input .bin to train on')
@@ -417,7 +419,9 @@ def main(input_bin, input_val_bin, batch_size, sequence_length, num_iterations, 
         weight_decay=weight_decay,
         val_loss_every=val_loss_every,
         val_tokens=val_tokens,
-        save_every=save_every
+        save_every=save_every,
+        wandb_project=wandb_project,
+        pretrained_weights=pretrained_weights
     )
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -433,173 +437,187 @@ def main(input_bin, input_val_bin, batch_size, sequence_length, num_iterations, 
 
     # Initialize wandb
     if master_process:
-        wandb.init(project=wandb_project, config=args.__dict__)
+        wandb.init(project=args.wandb_project, config=args.__dict__)
         run_id = wandb.run.id
         # Save the code to wandb
         wandb.run.log_code(".", include_fn=lambda path: path.endswith('train_gpt2.py'))
 
     # begin logging
-    def print0(s):
+    def print0(s, logonly=False):
         if master_process:
-            print(s)
-            # Optionally, log messages to wandb
+            if not logonly:
+                print(s)
             wandb.log({'message': s})
+
     # log information about the hardware/software environment this is running on
     # and print the full `nvidia-smi` to wandb
     print0(f"Running python {sys.version}")
-print0(f"Running pytorch {torch.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
+    print0(f"Running pytorch {torch.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:")
     import subprocess
     result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if master_process:
         wandb.log({'nvidia-smi': result.stdout})
-    print0('='*100)
+    print0('='*100, logonly=True)
 
-# calculate the number of steps to take in the val loop.
-assert args.val_tokens % (args.sequence_length * ddp_world_size) == 0
-val_steps = args.val_tokens // (args.sequence_length * ddp_world_size)
-# calculate the steps of gradient accumulation required to attain the desired global batch size.
-assert args.batch_size % (ddp_world_size) == 0
-train_accumulation_steps = args.batch_size // ddp_world_size
+    # calculate the number of steps to take in the val loop.
+    assert args.val_tokens % (args.sequence_length * ddp_world_size) == 0
+    val_steps = args.val_tokens // (args.sequence_length * ddp_world_size)
+    # calculate the steps of gradient accumulation required to attain the desired global batch size.
+    assert args.batch_size % (ddp_world_size) == 0
+    train_accumulation_steps = args.batch_size // ddp_world_size
 
-# load tokens
-train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp_rank, ddp_world_size)
-print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
-print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
-print0('='*100, logonly=True)
-inputs_train, targets_train = train_loader.next_batch()
+    # load tokens
+    train_loader = DistributedDataLoader(args.input_bin, args.sequence_length, ddp_rank, ddp_world_size)
+    val_loader = DistributedDataLoader(args.input_val_bin, args.sequence_length, ddp_rank, ddp_world_size)
+    print0(f"Training DataLoader: total number of tokens: {train_loader.total_num_tokens} across {len(train_loader.files)} files")
+    print0(f"Validation DataLoader: total number of tokens: {val_loader.total_num_tokens} across {len(val_loader.files)} files")
+    print0('='*100, logonly=True)
+    inputs_train, targets_train = train_loader.next_batch()
 
-# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
-# this originates from Karpathy's experiments.
-num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, num_layers=12, num_heads=6, model_dim=768))
-model = model.cuda().bfloat16()
-for m in model.modules():
-    if isinstance(m, CastedLinear):
-        m.float()
-if hasattr(config, "coordinate_descent_tuning"):
-    config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model)
-# here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module # always contains the "raw" unwrapped model
+    # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+    # this originates from Karpathy's experiments.
+    num_vocab = 50304
+    model = GPT(GPTConfig(vocab_size=num_vocab, num_layers=12, num_heads=6, model_dim=768))
+    model = model.cuda().bfloat16()
+    for m in model.modules():
+        if isinstance(m, CastedLinear):
+            m.float()
+    if hasattr(config, "coordinate_descent_tuning"):
+        config.coordinate_descent_tuning = True # suggested by @Chillee
+    model = torch.compile(model)
+    # here we wrap model into DDP container
+    model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module # always contains the "raw" unwrapped model
 
-# init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.embed.weight, raw_model.value_embeds.weight], lr=0.6, betas=(0.8, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
-params = list(raw_model.blocks.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
-optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
-# learning rate decay scheduler (linear warmup and cooldown)
-def get_lr(it):
-    assert it <= args.num_iterations
-    # 1) linear warmup for warmup_iters steps
-    if it < args.warmup_iters:
-        return (it+1) / args.warmup_iters
-    # 2) constant lr for a while
-    elif it < args.num_iterations - args.cooldown_iters:
-        return 1.0
-    # 3) linear cooldown
-    else:
-        decay_ratio = (args.num_iterations - it) / args.cooldown_iters
-        return decay_ratio
-schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+    # init the optimizer(s)
+    optimizer1 = torch.optim.Adam([raw_model.embed.weight, raw_model.value_embeds.weight], lr=0.6, betas=(0.8, 0.95), fused=True)
+    optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
+    params = list(raw_model.blocks.parameters())
+    matrix_params = [p for p in params if p.ndim == 2]
+    scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
+    optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
+    optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
+    optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+    # learning rate decay scheduler (linear warmup and cooldown)
+    def get_lr(it):
+        assert it <= args.num_iterations
+        # 1) linear warmup for warmup_iters steps
+        if it < args.warmup_iters:
+            return (it+1) / args.warmup_iters
+        # 2) constant lr for a while
+        elif it < args.num_iterations - args.cooldown_iters:
+            return 1.0
+        # 3) linear cooldown
+        else:
+            decay_ratio = (args.num_iterations - it) / args.cooldown_iters
+            return decay_ratio
+    schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-sliding_window_size = torch.tensor(64, dtype=torch.int32, device="cuda")
-sw_size_prev = 64
-# Start training loop
-training_time_ms = 0
-# start the clock
-torch.cuda.synchronize()
-t0 = time.perf_counter()
-# begin training
-for step in range(args.num_iterations + 1):
-    last_step = (step == args.num_iterations)
-    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
-    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
-    # steps with dummy data first, and then re-initialize the model and reset the loader.
-    if step == 10:
-        training_time_ms = 0
-        t0 = time.perf_counter()
-    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+    sliding_window_size = torch.tensor(64, dtype=torch.int32, device="cuda")
+    sw_size_prev = 64
+    # Start training loop
+    training_time_ms = 0
+    # start the clock
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    # begin training
+    for step in range(args.num_iterations + 1):
+        last_step = (step == args.num_iterations)
+        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+        # steps with dummy data first, and then re-initialize the model and reset the loader.
+        if step == 10:
+            training_time_ms = 0
+            t0 = time.perf_counter()
+        timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Linearly increase the sliding window size over training in chunks of 64 from 64 -> 1792. By @fernbear.bsky.social
-    frac_done = step / args.num_iterations # training progress
-    sw_size = 64 * (((1 - frac_done) * 64 + frac_done * 1792) // 64)
-    if sw_size != sw_size_prev:
-        sliding_window_size.copy_(sw_size, non_blocking=True)
-        sw_size_prev = sw_size
+        # Linearly increase the sliding window size over training in chunks of 64 from 64 -> 1792. By @fernbear.bsky.social
+        frac_done = step / args.num_iterations # training progress
+        sw_size = 64 * (((1 - frac_done) * 64 + frac_done * 1792) // 64)
+        if sw_size != sw_size_prev:
+            sliding_window_size.copy_(sw_size, non_blocking=True)
+            sw_size_prev = sw_size
 
-    # once in a while evaluate the validation dataset
-    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.perf_counter() - t0)
-        # run validation batches
-        model.eval()
-        val_loader.reset()
-        val_loss = 0.0
-        for _ in range(val_steps):
-            with torch.no_grad():
-                inputs_val, targets_val = val_loader.next_batch()
-                val_loss += model(inputs_val, targets_val, sliding_window_size)
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        val_loss /= val_steps
-        # log val loss to console and to logfile
-        print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
+        # once in a while evaluate the validation dataset
+        if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            # run validation batches
+            model.eval()
+            val_loader.reset()
+            val_loss = 0.0
+            for _ in range(val_steps):
+                with torch.no_grad():
+                    inputs_val, targets_val = val_loader.next_batch()
+                    val_loss += model(inputs_val, targets_val, sliding_window_size)
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+            val_loss /= val_steps
+            val_loss_item = val_loss.item()
+            # log val loss to console and to logfile
+            print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss_item:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            # Log validation loss to wandb
+            if master_process:
+                wandb.log({'Validation Loss': val_loss_item, 'Step': step})
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
-    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
-        # stop the clock
-        torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.perf_counter() - t0)
-        # save the state of the training process
-        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
-        # start the clock again
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
+        if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+            # stop the clock
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            # create logs directory if it doesn't exist
+            os.makedirs(f'logs/{run_id}', exist_ok=True)
+            # save the state of the training process
+            log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            torch.save(log, f'logs/{run_id}/state_step{step:06d}.pt')
+            # start the clock again
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
-        # bit confusing: we want to make sure to eval on 0th iteration
-        # but also after the very last iteration. so we loop for step <= num_iterations
-        # instead of just < num_iterations (one extra due to <=), only to do
-        # the validation/sampling one last time, and then we break right here as we're done.
-        if last_step:
-            break
+            # bit confusing: we want to make sure to eval on 0th iteration
+            # but also after the very last iteration. so we loop for step <= num_iterations
+            # instead of just < num_iterations (one extra due to <=), only to do
+            # the validation/sampling one last time, and then we break right here as we're done.
+            if last_step:
+                break
 
-    # --------------- TRAINING SECTION BEGIN -----------------
-    model.train()
-    for i in range(1, train_accumulation_steps+1):
-        ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
-        with ctx: # there's no need to sync gradients every accumulation step
-            loss = model(inputs_train, targets_train, sliding_window_size)
-            loss.backward()
-            del loss
-            inputs_train, targets_train = train_loader.next_batch()
-    if train_accumulation_steps != 1:
-        for p in model.parameters():
-            p.grad /= train_accumulation_steps
-    # momentum warmup for Muon
-    frac = min(step/300, 1)
-    for group in optimizer3.param_groups:
-        group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers and schedulers
-    for opt, sched in zip(optimizers, schedulers):
-        opt.step()
-        sched.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
-    # --------------- TRAINING SECTION END -------------------
-    # everything that follows now is just diagnostics, prints, logging, etc.
-    approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{args.num_iterations} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        # --------------- TRAINING SECTION BEGIN -----------------
+        model.train()
+        total_loss = 0.0
+        for i in range(1, train_accumulation_steps+1):
+            ctx = model.no_sync() if i < train_accumulation_steps else contextlib.nullcontext()
+            with ctx: # there's no need to sync gradients every accumulation step
+                loss = model(inputs_train, targets_train, sliding_window_size)
+                total_loss += loss.item()
+                loss.backward()
+                del loss
+                inputs_train, targets_train = train_loader.next_batch()
+        if train_accumulation_steps != 1:
+            for p in model.parameters():
+                p.grad /= train_accumulation_steps
+        avg_loss = total_loss / train_accumulation_steps
+        # momentum warmup for Muon
+        frac = min(step/300, 1)
+        for group in optimizer3.param_groups:
+            group['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+        # step the optimizers and schedulers
+        for opt, sched in zip(optimizers, schedulers):
+            opt.step()
+            sched.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
+        # Log training loss and learning rate
+        if master_process:
+            current_lr = optimizers[0].param_groups[0]['lr']
+            wandb.log({'Training Loss': avg_loss, 'Learning Rate': current_lr, 'Step': step})
+        # --------------- TRAINING SECTION END -------------------
+        # everything that follows now is just diagnostics, prints, logging, etc.
+        approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{args.num_iterations} train_loss:{avg_loss:.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
 
-print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
     # -------------------------------------------------------------------------
     # clean up nice
